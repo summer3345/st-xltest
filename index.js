@@ -1,12 +1,13 @@
 /**
- * 骰子扰动 (Dice Query Perturbation) v1.0.0
+ * 骰子扰动 (Dice Query Perturbation) v1.1.0
  *
  * 原理：拦截向量检索请求（/api/vector/query 与 /api/vector/query-multi），
  * 在 searchText 前注入随机抽取的意象短句（重复 N 次以保证剂量），
  * 使查询向量发生语义偏移，从而打散 top-k 命中结果。
  *
- * 只扰动查询（query），绝不触碰入库（insert），不污染语料本身。
- * 通过 collectionId 过滤，保护需要精准检索的库（如 Data Bank）。
+ * v1.1 变更：骰子库改为设置面板内直接编辑（纯文本格式，无需JSON），
+ * 存储在酒馆配置中，云端/手机可用，即改即生效。
+ * dice.json 仅作为首次启动的默认库来源保留。
  */
 
 const MODULE = 'dice_perturbation';
@@ -15,10 +16,11 @@ const LOG_TAG = '[骰子扰动]';
 const defaultSettings = {
     enabled: true,        // 总开关
     repeat: 3,            // 剂量：roll 结果重复拼接次数（1-10）
-    categoryFirst: true,  // 先随机选类目、再随机选条目（保证扰动方向铺满语义空间）
+    categoryFirst: true,  // 先随机选类目、再随机选条目
     logRoll: true,        // 在 F12 控制台打印每次 roll 结果
-    excludePrefixes: 'file_',  // 排除前缀（逗号分隔）：collectionId 以此开头的不扰动。file_ = Data Bank 文件库
-    whitelist: '',        // 白名单（逗号分隔）：非空时只扰动包含这些片段的 collectionId，排除前缀失效
+    excludePrefixes: 'file_',  // 排除前缀（逗号分隔）
+    whitelist: '',        // 白名单（逗号分隔）
+    diceText: '',         // 骰子库正文（面板内编辑的纯文本格式）
 };
 
 let diceLibrary = null;
@@ -53,14 +55,67 @@ function saveSettings() {
     }
 }
 
-async function loadDiceLibrary() {
+// ---------------------------------------------------------------
+// 骰子库：纯文本格式 <-> 库对象
+//
+// 文本格式（打词儿就行，没有任何符号要求）：
+//   ## 类目名
+//   一条语料
+//   另一条语料
+//
+//   ## 下一个类目
+//   ……
+//
+// 以 # 开头的行 = 类目标题；其余非空行 = 语料；空行随意。
+// ---------------------------------------------------------------
+
+function parseDiceText(text) {
+    const lib = {};
+    let current = '默认';
+    for (const raw of String(text || '').split('\n')) {
+        const line = raw.trim();
+        if (!line) continue;
+        if (line.startsWith('#')) {
+            current = line.replace(/^#+\s*/, '').trim() || '默认';
+            if (!lib[current]) lib[current] = [];
+            continue;
+        }
+        if (!lib[current]) lib[current] = [];
+        lib[current].push(line);
+    }
+    // 清掉空类目
+    for (const k of Object.keys(lib)) {
+        if (lib[k].length === 0) delete lib[k];
+    }
+    return lib;
+}
+
+function libraryToText(lib) {
+    return Object.entries(lib)
+        .map(([cat, items]) => `## ${cat}\n${items.join('\n')}`)
+        .join('\n\n');
+}
+
+function libraryStats(lib) {
+    const cats = Object.keys(lib || {});
+    const total = cats.reduce((n, k) => n + lib[k].length, 0);
+    return { cats: cats.length, total };
+}
+
+async function fetchDefaultLibraryText() {
     const url = new URL('./dice.json', import.meta.url);
     const res = await fetch(url, { cache: 'no-cache' });
     if (!res.ok) throw new Error(`dice.json 读取失败: HTTP ${res.status}`);
-    diceLibrary = await res.json();
-    const cats = Object.keys(diceLibrary);
-    const total = cats.reduce((n, k) => n + (Array.isArray(diceLibrary[k]) ? diceLibrary[k].length : 0), 0);
-    console.log(`${LOG_TAG} 骰子库已加载：${cats.length} 个类目，共 ${total} 条`);
+    const json = await res.json();
+    return libraryToText(json);
+}
+
+function applyDiceText(text) {
+    settings.diceText = text;
+    diceLibrary = parseDiceText(text);
+    const { cats, total } = libraryStats(diceLibrary);
+    $('#dice_pert_stats').text(`${cats} 个类目 / ${total} 条`);
+    saveSettings();
 }
 
 // ---------------------------------------------------------------
@@ -75,13 +130,11 @@ function rollDice() {
     if (cats.length === 0) return null;
 
     if (settings.categoryFirst) {
-        // 两段式：先选类目再选条目 —— 各类目出场概率均等，扰动方向铺满空间
         const cat = cats[Math.floor(Math.random() * cats.length)];
         const items = diceLibrary[cat];
         return { category: cat, text: items[Math.floor(Math.random() * items.length)] };
     }
 
-    // 扁平式：所有条目等概率（条目多的类目会更常出现）
     const all = [];
     for (const k of cats) {
         for (const item of diceLibrary[k]) all.push({ category: k, text: item });
@@ -114,10 +167,8 @@ function collectIds(body) {
 function idAllowed(id) {
     const wl = splitList(settings.whitelist);
     if (wl.length > 0) {
-        // 白名单模式：只有包含白名单片段的 collection 才被扰动
         return wl.some(w => id.includes(w));
     }
-    // 默认模式：排除指定前缀（如 Data Bank 的 file_），其余全部扰动
     const ex = splitList(settings.excludePrefixes);
     return !ex.some(p => id.startsWith(p));
 }
@@ -125,12 +176,9 @@ function idAllowed(id) {
 function shouldPerturb(body) {
     const ids = collectIds(body);
     if (ids.length === 0) {
-        // 拿不到 collectionId 的查询：保守起见仍然扰动，但在日志里标注
         return { perturb: true, ids: ['(无 collectionId)'] };
     }
     const allowed = ids.filter(idAllowed);
-    // 注意：query-multi 一次请求可能携带多个 collection，searchText 是共享的，
-    // 扰动是整体生效的。只要有一个 collection 在允许范围内就扰动，并完整记录日志。
     return { perturb: allowed.length > 0, ids };
 }
 
@@ -139,8 +187,6 @@ function shouldPerturb(body) {
 // ---------------------------------------------------------------
 
 function isVectorQueryUrl(url) {
-    // 覆盖 /api/vector/query 与 /api/vector/query-multi；
-    // 显式排除 insert/purge 等其它向量端点（其实它们也不含 'query'，双保险）
     return url.includes('/api/vector/query') && !url.includes('/insert');
 }
 
@@ -183,7 +229,6 @@ function installFetchHook() {
                 }
             }
         } catch (e) {
-            // 任何拦截环节出错都放行原请求，绝不让扰动失败拖垮检索本身
             console.warn(`${LOG_TAG} 拦截过程出错，已放行原请求`, e);
         }
         return origFetch.call(this, input, init);
@@ -194,7 +239,7 @@ function installFetchHook() {
 }
 
 // ---------------------------------------------------------------
-// 设置面板 UI（套用酒馆原生 drawer 样式）
+// 设置面板 UI
 // ---------------------------------------------------------------
 
 function settingsHtml() {
@@ -230,9 +275,18 @@ function settingsHtml() {
                     <label for="dice_pert_whitelist">白名单（逗号分隔；非空时只扰动匹配的 collection）</label>
                     <input id="dice_pert_whitelist" type="text" class="text_pole" placeholder="留空 = 排除模式" />
                 </div>
+                <hr />
+                <div>
+                    <label for="dice_pert_library">
+                        骰子库（<code>## 类目名</code> 一行开新类目，下面每行一条语料，改完即生效）
+                        — <span id="dice_pert_stats"></span>
+                    </label>
+                    <textarea id="dice_pert_library" class="text_pole textarea_compact" rows="14"
+                        placeholder="## 类目名&#10;一条语料&#10;另一条语料&#10;&#10;## 下一个类目&#10;……"></textarea>
+                </div>
                 <div class="flex-container" style="margin-top: 8px;">
                     <input id="dice_pert_test" class="menu_button" type="button" value="试掷一次 🎲" />
-                    <input id="dice_pert_reload" class="menu_button" type="button" value="重载骰子库" />
+                    <input id="dice_pert_reset" class="menu_button" type="button" value="恢复默认库" />
                 </div>
             </div>
         </div>
@@ -269,6 +323,14 @@ function bindSettingsUI() {
         .val(settings.whitelist)
         .on('input', function () { settings.whitelist = this.value; saveSettings(); });
 
+    $('#dice_pert_library')
+        .val(settings.diceText)
+        .on('input', function () { applyDiceText(this.value); });
+
+    // 初始统计
+    const { cats, total } = libraryStats(diceLibrary);
+    $('#dice_pert_stats').text(`${cats} 个类目 / ${total} 条`);
+
     $('#dice_pert_test').on('click', function () {
         const roll = rollDice();
         if (roll) {
@@ -276,14 +338,17 @@ function bindSettingsUI() {
             console.log(`${LOG_TAG} 试掷 🎲 ${msg}`);
             if (typeof toastr !== 'undefined') toastr.info(msg, '🎲 骰子扰动');
         } else {
-            if (typeof toastr !== 'undefined') toastr.warning('骰子库为空或未加载', '🎲 骰子扰动');
+            if (typeof toastr !== 'undefined') toastr.warning('骰子库为空', '🎲 骰子扰动');
         }
     });
 
-    $('#dice_pert_reload').on('click', async function () {
+    $('#dice_pert_reset').on('click', async function () {
+        if (!confirm('确定用默认库覆盖当前骰子库吗？你写的内容会被清掉。')) return;
         try {
-            await loadDiceLibrary();
-            if (typeof toastr !== 'undefined') toastr.success('骰子库已重载', '🎲 骰子扰动');
+            const text = await fetchDefaultLibraryText();
+            $('#dice_pert_library').val(text);
+            applyDiceText(text);
+            if (typeof toastr !== 'undefined') toastr.success('已恢复默认库', '🎲 骰子扰动');
         } catch (e) {
             console.error(`${LOG_TAG}`, e);
             if (typeof toastr !== 'undefined') toastr.error(String(e.message || e), '🎲 骰子扰动');
@@ -304,10 +369,24 @@ function addSettingsUI() {
 jQuery(async () => {
     try {
         loadSettings();
-        await loadDiceLibrary();
+
+        // 首次启动：面板库为空时，用 dice.json 的默认内容垫底
+        if (!settings.diceText || !settings.diceText.trim()) {
+            try {
+                settings.diceText = await fetchDefaultLibraryText();
+                saveSettings();
+            } catch (e) {
+                console.warn(`${LOG_TAG} 默认库读取失败，骰子库为空，请在面板里填写`, e);
+                settings.diceText = '';
+            }
+        }
+
+        diceLibrary = parseDiceText(settings.diceText);
         addSettingsUI();
         installFetchHook();
-        console.log(`${LOG_TAG} v1.0.0 已就绪 | 启用: ${settings.enabled} | 剂量: ×${settings.repeat}`);
+
+        const { cats, total } = libraryStats(diceLibrary);
+        console.log(`${LOG_TAG} v1.1.0 已就绪 | 启用: ${settings.enabled} | 剂量: ×${settings.repeat} | 骰子库: ${cats} 类 ${total} 条`);
     } catch (e) {
         console.error(`${LOG_TAG} 初始化失败`, e);
         if (typeof toastr !== 'undefined') {
