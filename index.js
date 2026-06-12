@@ -18,6 +18,7 @@ const defaultSettings = {
     repeat: 3,            // 剂量：roll 结果重复拼接次数（1-10）
     categoryFirst: true,  // 先随机选类目、再随机选条目
     logRoll: true,        // 在 F12 控制台打印每次 roll 结果
+    toastRoll: false,     // 每次 roll 弹通知（手机端验证用）
     excludePrefixes: 'file_',  // 排除前缀（逗号分隔）
     whitelist: '',        // 白名单（逗号分隔）
     diceText: '',         // 骰子库正文（面板内编辑的纯文本格式）
@@ -186,6 +187,24 @@ function shouldPerturb(body) {
 // fetch 拦截
 // ---------------------------------------------------------------
 
+// 最近 roll 记录（仅存内存，刷新即清，最多 20 条）
+const rollHistory = [];
+
+function recordRoll(roll, repeat, ids) {
+    const time = new Date().toLocaleTimeString();
+    rollHistory.unshift(`${time} 🎲 [${roll.category}] ${roll.text} ×${repeat}`);
+    if (rollHistory.length > 20) rollHistory.pop();
+    const $box = $('#dice_pert_history');
+    if ($box.length) $box.text(rollHistory.join('\n'));
+
+    if (settings.logRoll) {
+        console.log(`${LOG_TAG} 🎲 [${roll.category}] ${roll.text} ×${repeat} → collection: ${ids.join(', ')}`);
+    }
+    if (settings.toastRoll && typeof toastr !== 'undefined') {
+        toastr.info(`[${roll.category}] ${roll.text}`, '🎲 已注入', { timeOut: 3000 });
+    }
+}
+
 function isVectorQueryUrl(url) {
     return url.includes('/api/vector/query') && !url.includes('/insert');
 }
@@ -216,11 +235,7 @@ function installFetchHook() {
                                 body.searchText = injection + body.searchText;
                                 init = Object.assign({}, init, { body: JSON.stringify(body) });
 
-                                if (settings.logRoll) {
-                                    console.log(
-                                        `${LOG_TAG} 🎲 [${roll.category}] ${roll.text} ×${repeat} → collection: ${ids.join(', ')}`,
-                                    );
-                                }
+                                recordRoll(roll, repeat, ids);
                             }
                         } else if (settings.logRoll) {
                             console.log(`${LOG_TAG} ⛔ 已放行（过滤规则）→ collection: ${ids.join(', ')}`);
@@ -259,6 +274,10 @@ function settingsHtml() {
                     <input id="dice_pert_log" type="checkbox" />
                     <span>控制台打印 roll 结果（F12 查看）</span>
                 </label>
+                <label class="checkbox_label" for="dice_pert_toast">
+                    <input id="dice_pert_toast" type="checkbox" />
+                    <span>每次 roll 弹通知（手机端验证用）</span>
+                </label>
                 <label class="checkbox_label" for="dice_pert_catfirst">
                     <input id="dice_pert_catfirst" type="checkbox" />
                     <span>先抽类目再抽条目</span>
@@ -284,6 +303,10 @@ function settingsHtml() {
                     <textarea id="dice_pert_library" class="text_pole textarea_compact" rows="14"
                         placeholder="## 类目名&#10;一条语料&#10;另一条语料&#10;&#10;## 下一个类目&#10;……"></textarea>
                 </div>
+                <div style="margin-top: 8px;">
+                    <label>最近 roll 记录（实时，刷新页面即清空）</label>
+                    <pre id="dice_pert_history" style="max-height: 160px; overflow-y: auto; white-space: pre-wrap; font-size: 0.85em; opacity: 0.85; margin: 4px 0;">（还没有记录——发一条消息试试）</pre>
+                </div>
                 <div class="flex-container" style="margin-top: 8px;">
                     <input id="dice_pert_test" class="menu_button" type="button" value="试掷一次 🎲" />
                     <input id="dice_pert_reset" class="menu_button" type="button" value="恢复默认库" />
@@ -301,6 +324,10 @@ function bindSettingsUI() {
     $('#dice_pert_log')
         .prop('checked', settings.logRoll)
         .on('change', function () { settings.logRoll = this.checked; saveSettings(); });
+
+    $('#dice_pert_toast')
+        .prop('checked', settings.toastRoll)
+        .on('change', function () { settings.toastRoll = this.checked; saveSettings(); });
 
     $('#dice_pert_catfirst')
         .prop('checked', settings.categoryFirst)
@@ -386,7 +413,7 @@ jQuery(async () => {
         installFetchHook();
 
         const { cats, total } = libraryStats(diceLibrary);
-        console.log(`${LOG_TAG} v1.1.0 已就绪 | 启用: ${settings.enabled} | 剂量: ×${settings.repeat} | 骰子库: ${cats} 类 ${total} 条`);
+        console.log(`${LOG_TAG} v1.2.0 已就绪 | 启用: ${settings.enabled} | 剂量: ×${settings.repeat} | 骰子库: ${cats} 类 ${total} 条`);
     } catch (e) {
         console.error(`${LOG_TAG} 初始化失败`, e);
         if (typeof toastr !== 'undefined') {
