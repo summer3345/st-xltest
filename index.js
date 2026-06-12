@@ -1,13 +1,12 @@
 /**
- * 骰子扰动 (Dice Query Perturbation) v1.1.0
+ * 骰子扰动 (Dice Query Perturbation) v1.6.0
  *
- * 原理：拦截向量检索请求（/api/vector/query 与 /api/vector/query-multi），
+ * 原理：拦截向量检索请求（/api/vector/query 与 /api/vector/query-multi 等），
  * 在 searchText 前注入随机抽取的意象短句（重复 N 次以保证剂量），
  * 使查询向量发生语义偏移，从而打散 top-k 命中结果。
  *
- * v1.1 变更：骰子库改为设置面板内直接编辑（纯文本格式，无需JSON），
- * 存储在酒馆配置中，云端/手机可用，即改即生效。
- * dice.json 仅作为首次启动的默认库来源保留。
+ * v1.6 变更：每个卡池一个独立折叠编辑框（池名即标题，好找好改）；
+ * 原单一大文本框降级为「全库总览（高级）」；空卡池/空类目可保留。
  */
 
 const MODULE = 'dice_perturbation';
@@ -21,11 +20,11 @@ const defaultSettings = {
     toastRoll: false,     // 每次 roll 弹通知（手机端验证用）
     excludePrefixes: 'file_',  // 排除前缀（逗号分隔）
     whitelist: '',        // 白名单（逗号分隔）
-    diceText: '',         // 骰子库正文（面板内编辑的纯文本格式）
+    diceText: '',         // 骰子库正文（全库文本，单一事实来源）
     activePools: [],      // 启用的卡池名（空数组 = 全部启用）
 };
 
-let diceLibrary = null;
+let diceLibrary = {};   // { 池名: { 类目: [语料...] } }
 let settings = { ...defaultSettings };
 
 // ---------------------------------------------------------------
@@ -58,44 +57,67 @@ function saveSettings() {
 }
 
 // ---------------------------------------------------------------
-// 骰子库：纯文本格式 <-> 库对象
-//
-// 文本格式（打词儿就行）：
-//   # 卡池名          ← 单井号 = 开一个新卡池（剧情 / 场景 / 情感……）
-//   ## 类目名         ← 双井号 = 卡池内开一个类目
-//   一条语料
-//   另一条语料
-//
-// 没写任何 # 卡池行的内容自动归入「默认」池，完全兼容旧格式。
+// 骰子库：纯文本 <-> 库对象
+//   # 卡池名   单井号 = 卡池
+//   ## 类目名  双井号 = 类目
+//   其余非空行 = 语料
+// 空卡池/空类目会被保留（新建卡池后还没填语料也能显示出来）。
 // ---------------------------------------------------------------
 
 function parseDiceText(text) {
-    const lib = {};   // { 池名: { 类目: [语料...] } }
+    const lib = {};
     let pool = '默认';
     let cat = '默认';
+    const ensure = () => {
+        if (!lib[pool]) lib[pool] = {};
+        if (!lib[pool][cat]) lib[pool][cat] = [];
+    };
     for (const raw of String(text || '').split('\n')) {
         const line = raw.trim();
         if (!line) continue;
         if (line.startsWith('##')) {
             cat = line.replace(/^#+\s*/, '').trim() || '默认';
+            if (!lib[pool]) lib[pool] = {};
+            if (!lib[pool][cat]) lib[pool][cat] = [];
             continue;
         }
         if (line.startsWith('#')) {
             pool = line.replace(/^#+\s*/, '').trim() || '默认';
             cat = '默认';
+            if (!lib[pool]) lib[pool] = {};
             continue;
         }
-        if (!lib[pool]) lib[pool] = {};
-        if (!lib[pool][cat]) lib[pool][cat] = [];
+        ensure();
         lib[pool][cat].push(line);
     }
     return lib;
 }
 
-function libraryToText(lib) {
-    // 仅用于把默认 dice.json（无池的旧格式 { 类目: [...] }）转成文本
-    return Object.entries(lib)
-        .map(([cat, items]) => `## ${cat}\n${items.join('\n')}`)
+// 单池片段（## 类目 + 语料行）-> 类目表；片段里出现的 # 行也宽容地并入
+function poolFragmentToCatMap(text) {
+    const parsed = parseDiceText(text);
+    const out = {};
+    for (const p of Object.keys(parsed)) {
+        for (const c of Object.keys(parsed[p])) {
+            if (!out[c]) out[c] = [];
+            out[c] = out[c].concat(parsed[p][c]);
+        }
+    }
+    return out;
+}
+
+function catMapToText(catMap) {
+    return Object.entries(catMap || {})
+        .map(([cat, items]) => `## ${cat}` + (items.length ? `\n${items.join('\n')}` : ''))
+        .join('\n\n');
+}
+
+function poolsToText(lib) {
+    return Object.entries(lib || {})
+        .map(([pool, catMap]) => {
+            const body = catMapToText(catMap);
+            return `# ${pool}` + (body ? `\n${body}` : '');
+        })
         .join('\n\n');
 }
 
@@ -110,13 +132,19 @@ function libraryStats(lib) {
     return { pools: poolNames.length, cats, total };
 }
 
+function poolStats(catMap) {
+    const cs = Object.keys(catMap || {});
+    let total = 0;
+    for (const c of cs) total += catMap[c].length;
+    return { cats: cs.length, total };
+}
+
 function getActivePools() {
-    if (!diceLibrary) return [];
-    const all = Object.keys(diceLibrary);
+    const all = Object.keys(diceLibrary || {});
     const sel = Array.isArray(settings.activePools)
         ? settings.activePools.filter(p => all.includes(p))
         : [];
-    return sel.length ? sel : all; // 全不勾 = 全部启用
+    return sel.length ? sel : all; // 没选 = 全部启用
 }
 
 async function fetchDefaultLibraryText() {
@@ -124,105 +152,27 @@ async function fetchDefaultLibraryText() {
     const res = await fetch(url, { cache: 'no-cache' });
     if (!res.ok) throw new Error(`dice.json 读取失败: HTTP ${res.status}`);
     const json = await res.json();
-    return libraryToText(json);
+    // 默认库是旧格式 { 类目: [...] }，转成 ## 文本（归入「默认」池）
+    return Object.entries(json)
+        .map(([cat, items]) => `## ${cat}\n${items.join('\n')}`)
+        .join('\n\n');
 }
 
-function updateStatsLine() {
-    if (!diceLibrary) return;
-    const { pools, cats, total } = libraryStats(diceLibrary);
-    const hasSelection = Array.isArray(settings.activePools) && settings.activePools.length > 0;
-    const actText = hasSelection ? `启用：${getActivePools().join('、')}` : '启用：全部';
-    $('#dice_pert_stats').text(`${pools} 池 / ${cats} 类 / ${total} 条 · ${actText}`);
-}
+// ---------------------------------------------------------------
+// 状态提交中枢：所有改库的路径最后都汇到这里
+// ---------------------------------------------------------------
 
-function createNewPool() {
-    const name = (window.prompt('新卡池的名字？（例如：剧情 / 情感 / 场景）') || '').trim();
-    if (!name) return;
-    if (name.includes('#')) {
-        if (typeof toastr !== 'undefined') toastr.warning('池名里不要带 # 号', '🎲 骰子扰动');
-        return;
-    }
-    if (diceLibrary && Object.keys(diceLibrary).includes(name)) {
-        if (typeof toastr !== 'undefined') toastr.warning(`卡池「${name}」已存在`, '🎲 骰子扰动');
-        return;
-    }
-    const newText = (settings.diceText || '').replace(/\s+$/, '') + `\n\n# ${name}\n## 默认\n`;
-    $('#dice_pert_library').val(newText);
-    applyDiceText(newText);
-    if (typeof toastr !== 'undefined') {
-        toastr.success(`卡池「${name}」已创建——去骰子库末尾往它下面填语料`, '🎲 骰子扰动');
-    }
-}
-
-function chipToggle(pool) {
-    const all = Object.keys(diceLibrary || {});
-    let sel = Array.isArray(settings.activePools)
-        ? settings.activePools.filter(p => all.includes(p))
-        : [];
-    if (sel.length === 0) {
-        // 当前=全部启用：点某个池 → 只用这个池（直白切换）
-        sel = [pool];
-    } else if (sel.includes(pool)) {
-        sel = sel.filter(p => p !== pool);   // 取消选中；清空则回到全部
-    } else {
-        sel.push(pool);                       // 加选
-    }
-    settings.activePools = sel;
+function commitLibrary(opts) {
+    const o = Object.assign({ rebuildEditors: false, rebuildChips: true, syncMaster: true }, opts || {});
+    settings.diceText = poolsToText(diceLibrary);
     saveSettings();
-    renderPoolSelector();
     updateStatsLine();
-}
-
-function renderPoolSelector() {
-    const $box = $('#dice_pert_pools');
-    if (!$box.length || !diceLibrary) return;
-    const pools = Object.keys(diceLibrary);
-    const active = getActivePools();
-    const explicit = Array.isArray(settings.activePools) && settings.activePools.length > 0;
-    $box.empty();
-
-    const $row = $('<div style="display:flex; flex-wrap:wrap; gap:6px; align-items:center;"></div>');
-
-    if (pools.length > 1) {
-        // 「全部」胶囊
-        const $allChip = $('<input type="button" class="menu_button" />')
-            .val(explicit ? '全部' : '✓ 全部')
-            .css('opacity', explicit ? 0.55 : 1)
-            .on('click', function () {
-                settings.activePools = [];
-                saveSettings();
-                renderPoolSelector();
-                updateStatsLine();
-            });
-        $row.append($allChip);
-
-        // 每个池一个胶囊：高亮=启用中，点按直白切换
-        for (const p of pools) {
-            const isOn = active.includes(p);
-            const $chip = $('<input type="button" class="menu_button" />')
-                .val((explicit && isOn ? '✓ ' : '') + p)
-                .css('opacity', isOn ? 1 : 0.55)
-                .on('click', function () { chipToggle(p); });
-            $row.append($chip);
-        }
-    } else {
-        $row.append($('<small style="opacity:.7;"></small>')
-            .text('目前只有一个卡池——点「新建卡池」分区（剧情/场景/情感），分出来就能一键切换。'));
+    if (o.rebuildChips) renderPoolSelector();
+    if (o.rebuildEditors) renderPoolEditors();
+    if (o.syncMaster) {
+        const $m = $('#dice_pert_library');
+        if ($m.length && !$m.is(':focus')) $m.val(settings.diceText);
     }
-
-    const $newBtn = $('<input type="button" class="menu_button" value="➕ 新建卡池" />')
-        .on('click', createNewPool);
-    $row.append($newBtn);
-
-    $box.append($row);
-}
-
-function applyDiceText(text) {
-    settings.diceText = text;
-    diceLibrary = parseDiceText(text);
-    renderPoolSelector();
-    updateStatsLine();
-    saveSettings();
 }
 
 // ---------------------------------------------------------------
@@ -230,11 +180,10 @@ function applyDiceText(text) {
 // ---------------------------------------------------------------
 
 function rollDice() {
-    if (!diceLibrary) return null;
     const pools = getActivePools();
     const cats = [];
     for (const p of pools) {
-        for (const c of Object.keys(diceLibrary[p])) {
+        for (const c of Object.keys(diceLibrary[p] || {})) {
             if (diceLibrary[p][c].length > 0) {
                 cats.push({ pool: p, cat: c, items: diceLibrary[p][c] });
             }
@@ -295,10 +244,9 @@ function shouldPerturb(body) {
 }
 
 // ---------------------------------------------------------------
-// fetch 拦截
+// roll 记录
 // ---------------------------------------------------------------
 
-// 最近 roll 记录（仅存内存，刷新即清，最多 20 条）
 const rollHistory = [];
 
 function recordRoll(roll, repeat, ids) {
@@ -318,9 +266,12 @@ function recordRoll(roll, repeat, ids) {
     }
 }
 
+// ---------------------------------------------------------------
+// fetch 拦截
+// ---------------------------------------------------------------
+
 function isVectorQueryUrl(url) {
     // 宽松匹配：兼容 /api/vector/query、/api/vectors/query、query-multi、以及云端部署的路径前缀
-    // 显式排除 insert/purge 等其它向量端点
     return url.includes('/vector') && url.includes('/query') && !url.includes('/insert') && !url.includes('/purge');
 }
 
@@ -369,6 +320,7 @@ function installFetchHook() {
                 }
             }
         } catch (e) {
+            // 任何拦截环节出错都放行原请求，绝不让扰动失败拖垮检索本身
             console.warn(`${LOG_TAG} 拦截过程出错，已放行原请求`, e);
         }
         return origFetch.call(this, input, init);
@@ -379,8 +331,170 @@ function installFetchHook() {
 }
 
 // ---------------------------------------------------------------
+// 卡池操作
+// ---------------------------------------------------------------
+
+function createNewPool() {
+    const name = (window.prompt('新卡池的名字？（例如：剧情 / 情感 / 场景）') || '').trim();
+    if (!name) return;
+    if (name.includes('#')) {
+        if (typeof toastr !== 'undefined') toastr.warning('池名里不要带 # 号', '🎲 骰子扰动');
+        return;
+    }
+    if (Object.keys(diceLibrary).includes(name)) {
+        if (typeof toastr !== 'undefined') toastr.warning(`卡池「${name}」已存在`, '🎲 骰子扰动');
+        return;
+    }
+    diceLibrary[name] = { '默认': [] };
+    commitLibrary({ rebuildEditors: true });
+    // 新建后自动展开它的编辑框
+    const $drawer = $(`#dice_pert_pool_editors .dice-pool-editor[data-pool-b64="${b64(name)}"]`);
+    if ($drawer.length) {
+        $drawer.find('.dice-pool-editor-content').show();
+        $drawer.find('.dice-pool-editor-arrow').text('▼');
+    }
+    if (typeof toastr !== 'undefined') {
+        toastr.success(`卡池「${name}」已创建，往它的框里填语料吧`, '🎲 骰子扰动');
+    }
+}
+
+function deletePool(name) {
+    if (!window.confirm(`确定删除卡池「${name}」吗？池里的语料会一起删除。`)) return;
+    delete diceLibrary[name];
+    if (Array.isArray(settings.activePools)) {
+        settings.activePools = settings.activePools.filter(p => p !== name);
+    }
+    commitLibrary({ rebuildEditors: true });
+    if (typeof toastr !== 'undefined') toastr.info(`卡池「${name}」已删除`, '🎲 骰子扰动');
+}
+
+function chipToggle(pool) {
+    const all = Object.keys(diceLibrary || {});
+    let sel = Array.isArray(settings.activePools)
+        ? settings.activePools.filter(p => all.includes(p))
+        : [];
+    if (sel.length === 0) {
+        sel = [pool];                         // 当前=全部：点谁就只用谁
+    } else if (sel.includes(pool)) {
+        sel = sel.filter(p => p !== pool);    // 取消选中；清空则回到全部
+    } else {
+        sel.push(pool);                       // 加选
+    }
+    settings.activePools = sel;
+    saveSettings();
+    renderPoolSelector();
+    updateStatsLine();
+}
+
+// ---------------------------------------------------------------
 // 设置面板 UI
 // ---------------------------------------------------------------
+
+// 池名 -> 安全的 DOM 标识（避免特殊字符进选择器）
+function b64(s) {
+    try {
+        return btoa(unescape(encodeURIComponent(s))).replace(/[^a-zA-Z0-9]/g, '');
+    } catch (e) {
+        return String(s).replace(/[^a-zA-Z0-9\u4e00-\u9fff]/g, '');
+    }
+}
+
+function updateStatsLine() {
+    const { pools, cats, total } = libraryStats(diceLibrary);
+    const hasSelection = Array.isArray(settings.activePools) && settings.activePools.length > 0;
+    const actText = hasSelection ? `启用：${getActivePools().join('、')}` : '启用：全部';
+    $('#dice_pert_stats').text(`${pools} 池 / ${cats} 类 / ${total} 条 · ${actText}`);
+}
+
+function renderPoolSelector() {
+    const $box = $('#dice_pert_pools');
+    if (!$box.length) return;
+    const pools = Object.keys(diceLibrary);
+    const active = getActivePools();
+    const explicit = Array.isArray(settings.activePools) && settings.activePools.length > 0;
+    $box.empty();
+
+    const $row = $('<div style="display:flex; flex-wrap:wrap; gap:6px; align-items:center;"></div>');
+
+    if (pools.length > 1) {
+        const $allChip = $('<input type="button" class="menu_button" />')
+            .val(explicit ? '全部' : '✓ 全部')
+            .css('opacity', explicit ? 0.55 : 1)
+            .on('click', function () {
+                settings.activePools = [];
+                saveSettings();
+                renderPoolSelector();
+                updateStatsLine();
+            });
+        $row.append($allChip);
+
+        for (const p of pools) {
+            const isOn = active.includes(p);
+            const $chip = $('<input type="button" class="menu_button" />')
+                .val((explicit && isOn ? '✓ ' : '') + p)
+                .css('opacity', isOn ? 1 : 0.55)
+                .on('click', function () { chipToggle(p); });
+            $row.append($chip);
+        }
+    } else {
+        $row.append($('<small style="opacity:.7;"></small>')
+            .text('目前只有一个卡池——点「新建卡池」分区（剧情/场景/情感），每个池会有自己的编辑框。'));
+    }
+
+    const $newBtn = $('<input type="button" class="menu_button" value="➕ 新建卡池" />')
+        .on('click', createNewPool);
+    $row.append($newBtn);
+
+    $box.append($row);
+}
+
+// 每个卡池一个折叠编辑框
+function renderPoolEditors() {
+    const $wrap = $('#dice_pert_pool_editors');
+    if (!$wrap.length) return;
+    $wrap.empty();
+
+    for (const pool of Object.keys(diceLibrary)) {
+        const { cats, total } = poolStats(diceLibrary[pool]);
+
+        const $editor = $('<div class="dice-pool-editor" style="border:1px solid var(--SmartThemeBorderColor, #888); border-radius:6px; margin:6px 0; overflow:hidden;"></div>')
+            .attr('data-pool-b64', b64(pool));
+
+        // 头部（自带开合，不依赖酒馆的 drawer 委托）
+        const $arrow = $('<span class="dice-pool-editor-arrow" style="width:1.2em; display:inline-block;">▶</span>');
+        const $title = $('<b></b>').text(`📦 ${pool}`);
+        const $count = $('<span class="dice-pool-editor-count" style="opacity:.7; margin-left:6px;"></span>')
+            .text(`（${cats} 类 / ${total} 条）`);
+        const $header = $('<div style="display:flex; align-items:center; gap:4px; padding:6px 8px; cursor:pointer; user-select:none;"></div>')
+            .append($arrow, $title, $count);
+
+        // 内容
+        const $content = $('<div class="dice-pool-editor-content" style="display:none; padding:0 8px 8px 8px;"></div>');
+        const $ta = $('<textarea class="text_pole textarea_compact" rows="10" style="width:100%;"></textarea>')
+            .attr('placeholder', '## 类目名\n一条语料\n另一条语料')
+            .val(catMapToText(diceLibrary[pool]));
+        const $del = $('<input type="button" class="menu_button" value="🗑 删除此池" style="margin-top:6px;" />')
+            .on('click', function () { deletePool(pool); });
+        $content.append($ta, $('<div></div>').append($del));
+
+        $header.on('click', function () {
+            const open = $content.is(':visible');
+            $content.toggle(!open);
+            $arrow.text(open ? '▶' : '▼');
+        });
+
+        // 池内编辑：只更新数据和总览/统计，不重建编辑框（保护光标）
+        $ta.on('input', function () {
+            diceLibrary[pool] = poolFragmentToCatMap(this.value);
+            const s = poolStats(diceLibrary[pool]);
+            $count.text(`（${s.cats} 类 / ${s.total} 条）`);
+            commitLibrary({ rebuildEditors: false, rebuildChips: false });
+        });
+
+        $editor.append($header, $content);
+        $wrap.append($editor);
+    }
+}
 
 function settingsHtml() {
     return `
@@ -422,12 +536,19 @@ function settingsHtml() {
                 <hr />
                 <div id="dice_pert_pools" style="margin: 6px 0;"></div>
                 <div>
-                    <label for="dice_pert_library">
-                        骰子库（<code># 卡池名</code> 开新卡池，<code>## 类目名</code> 开新类目，每行一条语料，改完即生效）
-                        — <span id="dice_pert_stats"></span>
-                    </label>
-                    <textarea id="dice_pert_library" class="text_pole textarea_compact" rows="14"
-                        placeholder="## 类目名&#10;一条语料&#10;另一条语料&#10;&#10;## 下一个类目&#10;……"></textarea>
+                    <span>骰子库 — <span id="dice_pert_stats"></span></span>
+                </div>
+                <div id="dice_pert_pool_editors"></div>
+                <div class="inline-drawer" style="margin-top: 8px;">
+                    <div class="inline-drawer-toggle inline-drawer-header">
+                        <b>📄 全库总览（高级）</b>
+                        <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+                    </div>
+                    <div class="inline-drawer-content">
+                        <small style="opacity:.7;">完整文本视图：<code># 卡池名</code> 开新卡池，<code>## 类目名</code> 开新类目。在这里批量整理时，上面的池编辑框会同步。</small>
+                        <textarea id="dice_pert_library" class="text_pole textarea_compact" rows="14"
+                            placeholder="# 卡池名&#10;## 类目名&#10;一条语料&#10;另一条语料"></textarea>
+                    </div>
                 </div>
                 <div class="inline-drawer" style="margin-top: 8px;">
                     <div class="inline-drawer-toggle inline-drawer-header">
@@ -446,6 +567,22 @@ function settingsHtml() {
             </div>
         </div>
     </div>`;
+}
+
+let masterInputTimer = null;
+
+function handleMasterInput(value) {
+    // 打字时保留用户原文，不立刻反序列化覆盖
+    settings.diceText = value;
+    diceLibrary = parseDiceText(value);
+    saveSettings();
+    updateStatsLine();
+    // 结构与内容的重渲染做防抖，避免每个键击都重建编辑框
+    if (masterInputTimer) clearTimeout(masterInputTimer);
+    masterInputTimer = setTimeout(() => {
+        renderPoolSelector();
+        renderPoolEditors();
+    }, 500);
 }
 
 function bindSettingsUI() {
@@ -484,11 +621,7 @@ function bindSettingsUI() {
 
     $('#dice_pert_library')
         .val(settings.diceText)
-        .on('input', function () { applyDiceText(this.value); });
-
-    // 初始渲染：卡池选择器 + 统计
-    renderPoolSelector();
-    updateStatsLine();
+        .on('input', function () { handleMasterInput(this.value); });
 
     $('#dice_pert_clear_history').on('click', function () {
         rollHistory.length = 0;
@@ -503,22 +636,30 @@ function bindSettingsUI() {
             console.log(`${LOG_TAG} 试掷 🎲 ${msg}`);
             if (typeof toastr !== 'undefined') toastr.info(msg, '🎲 骰子扰动');
         } else {
-            if (typeof toastr !== 'undefined') toastr.warning('骰子库为空', '🎲 骰子扰动');
+            if (typeof toastr !== 'undefined') toastr.warning('启用的卡池里没有语料', '🎲 骰子扰动');
         }
     });
 
     $('#dice_pert_reset').on('click', async function () {
-        if (!confirm('确定用默认库覆盖当前骰子库吗？你写的内容会被清掉。')) return;
+        if (!window.confirm('确定用默认库覆盖当前骰子库吗？你写的所有卡池和语料都会被清掉。')) return;
         try {
             const text = await fetchDefaultLibraryText();
+            settings.diceText = text;
+            diceLibrary = parseDiceText(text);
+            settings.activePools = [];
             $('#dice_pert_library').val(text);
-            applyDiceText(text);
+            commitLibrary({ rebuildEditors: true });
             if (typeof toastr !== 'undefined') toastr.success('已恢复默认库', '🎲 骰子扰动');
         } catch (e) {
             console.error(`${LOG_TAG}`, e);
             if (typeof toastr !== 'undefined') toastr.error(String(e.message || e), '🎲 骰子扰动');
         }
     });
+
+    // 初始渲染
+    renderPoolSelector();
+    renderPoolEditors();
+    updateStatsLine();
 }
 
 function addSettingsUI() {
@@ -526,10 +667,6 @@ function addSettingsUI() {
     $(target).append(settingsHtml());
     bindSettingsUI();
 }
-
-// ---------------------------------------------------------------
-// 入口
-// ---------------------------------------------------------------
 
 // ---------------------------------------------------------------
 // 斜杠命令 /dicepool —— 供 Quick Reply 一键切换卡池
@@ -540,7 +677,6 @@ function addSettingsUI() {
 // ---------------------------------------------------------------
 
 function setActivePoolsByName(value) {
-    if (!diceLibrary) return '🎲 骰子库未加载';
     const v = String(value || '').trim();
 
     if (v === 'on' || v === '开') {
@@ -556,7 +692,7 @@ function setActivePoolsByName(value) {
         return '🎲 扰动已关闭';
     }
 
-    const all = Object.keys(diceLibrary);
+    const all = Object.keys(diceLibrary || {});
     let msg;
     if (!v || v === 'all' || v === '全部') {
         settings.activePools = [];
@@ -602,11 +738,15 @@ function registerSlashCommand() {
             console.log(`${LOG_TAG} 斜杠命令 /dicepool 已注册（旧API）`);
             return;
         }
-        console.warn(`${LOG_TAG} 未找到斜杠命令注册接口，/dicepool 不可用（面板勾选仍可用）`);
+        console.warn(`${LOG_TAG} 未找到斜杠命令注册接口，/dicepool 不可用（面板按钮仍可用）`);
     } catch (e) {
-        console.warn(`${LOG_TAG} 斜杠命令注册失败，面板勾选仍可用`, e);
+        console.warn(`${LOG_TAG} 斜杠命令注册失败，面板按钮仍可用`, e);
     }
 }
+
+// ---------------------------------------------------------------
+// 入口
+// ---------------------------------------------------------------
 
 jQuery(async () => {
     try {
@@ -629,7 +769,7 @@ jQuery(async () => {
         registerSlashCommand();
 
         const { pools, cats, total } = libraryStats(diceLibrary);
-        console.log(`${LOG_TAG} v1.5.0 已就绪 | 启用: ${settings.enabled} | 剂量: ×${settings.repeat} | 骰子库: ${pools} 池 ${cats} 类 ${total} 条`);
+        console.log(`${LOG_TAG} v1.6.0 已就绪 | 启用: ${settings.enabled} | 剂量: ×${settings.repeat} | 骰子库: ${pools} 池 ${cats} 类 ${total} 条`);
     } catch (e) {
         console.error(`${LOG_TAG} 初始化失败`, e);
         if (typeof toastr !== 'undefined') {
