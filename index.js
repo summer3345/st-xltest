@@ -22,6 +22,7 @@ const defaultSettings = {
     excludePrefixes: 'file_',  // 排除前缀（逗号分隔）
     whitelist: '',        // 白名单（逗号分隔）
     diceText: '',         // 骰子库正文（面板内编辑的纯文本格式）
+    activePools: [],      // 启用的卡池名（空数组 = 全部启用）
 };
 
 let diceLibrary = null;
@@ -59,48 +60,63 @@ function saveSettings() {
 // ---------------------------------------------------------------
 // 骰子库：纯文本格式 <-> 库对象
 //
-// 文本格式（打词儿就行，没有任何符号要求）：
-//   ## 类目名
+// 文本格式（打词儿就行）：
+//   # 卡池名          ← 单井号 = 开一个新卡池（剧情 / 场景 / 情感……）
+//   ## 类目名         ← 双井号 = 卡池内开一个类目
 //   一条语料
 //   另一条语料
 //
-//   ## 下一个类目
-//   ……
-//
-// 以 # 开头的行 = 类目标题；其余非空行 = 语料；空行随意。
+// 没写任何 # 卡池行的内容自动归入「默认」池，完全兼容旧格式。
 // ---------------------------------------------------------------
 
 function parseDiceText(text) {
-    const lib = {};
-    let current = '默认';
+    const lib = {};   // { 池名: { 类目: [语料...] } }
+    let pool = '默认';
+    let cat = '默认';
     for (const raw of String(text || '').split('\n')) {
         const line = raw.trim();
         if (!line) continue;
-        if (line.startsWith('#')) {
-            current = line.replace(/^#+\s*/, '').trim() || '默认';
-            if (!lib[current]) lib[current] = [];
+        if (line.startsWith('##')) {
+            cat = line.replace(/^#+\s*/, '').trim() || '默认';
             continue;
         }
-        if (!lib[current]) lib[current] = [];
-        lib[current].push(line);
-    }
-    // 清掉空类目
-    for (const k of Object.keys(lib)) {
-        if (lib[k].length === 0) delete lib[k];
+        if (line.startsWith('#')) {
+            pool = line.replace(/^#+\s*/, '').trim() || '默认';
+            cat = '默认';
+            continue;
+        }
+        if (!lib[pool]) lib[pool] = {};
+        if (!lib[pool][cat]) lib[pool][cat] = [];
+        lib[pool][cat].push(line);
     }
     return lib;
 }
 
 function libraryToText(lib) {
+    // 仅用于把默认 dice.json（无池的旧格式 { 类目: [...] }）转成文本
     return Object.entries(lib)
         .map(([cat, items]) => `## ${cat}\n${items.join('\n')}`)
         .join('\n\n');
 }
 
 function libraryStats(lib) {
-    const cats = Object.keys(lib || {});
-    const total = cats.reduce((n, k) => n + lib[k].length, 0);
-    return { cats: cats.length, total };
+    const poolNames = Object.keys(lib || {});
+    let cats = 0, total = 0;
+    for (const p of poolNames) {
+        const cs = Object.keys(lib[p]);
+        cats += cs.length;
+        for (const c of cs) total += lib[p][c].length;
+    }
+    return { pools: poolNames.length, cats, total };
+}
+
+function getActivePools() {
+    if (!diceLibrary) return [];
+    const all = Object.keys(diceLibrary);
+    const sel = Array.isArray(settings.activePools)
+        ? settings.activePools.filter(p => all.includes(p))
+        : [];
+    return sel.length ? sel : all; // 全不勾 = 全部启用
 }
 
 async function fetchDefaultLibraryText() {
@@ -111,11 +127,48 @@ async function fetchDefaultLibraryText() {
     return libraryToText(json);
 }
 
+function updateStatsLine() {
+    if (!diceLibrary) return;
+    const { pools, cats, total } = libraryStats(diceLibrary);
+    const hasSelection = Array.isArray(settings.activePools) && settings.activePools.length > 0;
+    const actText = hasSelection ? `启用：${getActivePools().join('、')}` : '启用：全部';
+    $('#dice_pert_stats').text(`${pools} 池 / ${cats} 类 / ${total} 条 · ${actText}`);
+}
+
+function renderPoolSelector() {
+    const $box = $('#dice_pert_pools');
+    if (!$box.length || !diceLibrary) return;
+    const pools = Object.keys(diceLibrary);
+    const active = Array.isArray(settings.activePools) ? settings.activePools : [];
+    $box.empty();
+    if (pools.length <= 1) {
+        $box.append($('<small style="opacity:.7;"></small>')
+            .text('提示：在骰子库里用一行「# 卡池名」可分出多个卡池（剧情/场景/情感），在这里勾选切换。'));
+        return;
+    }
+    $box.append($('<small style="opacity:.7; display:block; margin-bottom:2px;"></small>')
+        .text('启用的卡池（可多选；全不勾 = 全部启用）：'));
+    for (const p of pools) {
+        const $label = $('<label class="checkbox_label" style="display:inline-flex; margin-right:12px;"></label>');
+        const $cb = $('<input type="checkbox" class="dice_pert_pool_cb">')
+            .val(p)
+            .prop('checked', active.includes(p));
+        $label.append($cb).append($('<span></span>').text(p));
+        $box.append($label);
+    }
+    $box.find('.dice_pert_pool_cb').on('change', function () {
+        settings.activePools = $box.find('.dice_pert_pool_cb:checked')
+            .map(function () { return $(this).val(); }).get();
+        saveSettings();
+        updateStatsLine();
+    });
+}
+
 function applyDiceText(text) {
     settings.diceText = text;
     diceLibrary = parseDiceText(text);
-    const { cats, total } = libraryStats(diceLibrary);
-    $('#dice_pert_stats').text(`${cats} 个类目 / ${total} 条`);
+    renderPoolSelector();
+    updateStatsLine();
     saveSettings();
 }
 
@@ -125,20 +178,25 @@ function applyDiceText(text) {
 
 function rollDice() {
     if (!diceLibrary) return null;
-    const cats = Object.keys(diceLibrary).filter(
-        k => Array.isArray(diceLibrary[k]) && diceLibrary[k].length > 0,
-    );
+    const pools = getActivePools();
+    const cats = [];
+    for (const p of pools) {
+        for (const c of Object.keys(diceLibrary[p])) {
+            if (diceLibrary[p][c].length > 0) {
+                cats.push({ pool: p, cat: c, items: diceLibrary[p][c] });
+            }
+        }
+    }
     if (cats.length === 0) return null;
 
     if (settings.categoryFirst) {
-        const cat = cats[Math.floor(Math.random() * cats.length)];
-        const items = diceLibrary[cat];
-        return { category: cat, text: items[Math.floor(Math.random() * items.length)] };
+        const c = cats[Math.floor(Math.random() * cats.length)];
+        return { pool: c.pool, category: c.cat, text: c.items[Math.floor(Math.random() * c.items.length)] };
     }
 
     const all = [];
-    for (const k of cats) {
-        for (const item of diceLibrary[k]) all.push({ category: k, text: item });
+    for (const c of cats) {
+        for (const item of c.items) all.push({ pool: c.pool, category: c.cat, text: item });
     }
     return all[Math.floor(Math.random() * all.length)];
 }
@@ -192,7 +250,7 @@ const rollHistory = [];
 
 function recordRoll(roll, repeat, ids) {
     const time = new Date().toLocaleTimeString();
-    rollHistory.unshift(`${time} 🎲 [${roll.category}] ${roll.text} ×${repeat}`);
+    rollHistory.unshift(`${time} 🎲 [${roll.pool}/${roll.category}] ${roll.text} ×${repeat}`);
     if (rollHistory.length > 10) rollHistory.pop();
     const $box = $('#dice_pert_history');
     if ($box.length) $box.text(rollHistory.join('\n'));
@@ -200,10 +258,10 @@ function recordRoll(roll, repeat, ids) {
     if ($count.length) $count.text(rollHistory.length);
 
     if (settings.logRoll) {
-        console.log(`${LOG_TAG} 🎲 [${roll.category}] ${roll.text} ×${repeat} → collection: ${ids.join(', ')}`);
+        console.log(`${LOG_TAG} 🎲 [${roll.pool}/${roll.category}] ${roll.text} ×${repeat} → collection: ${ids.join(', ')}`);
     }
     if (settings.toastRoll && typeof toastr !== 'undefined') {
-        toastr.info(`[${roll.category}] ${roll.text}`, '🎲 已注入', { timeOut: 3000 });
+        toastr.info(`[${roll.pool}/${roll.category}] ${roll.text}`, '🎲 已注入', { timeOut: 3000 });
     }
 }
 
@@ -309,9 +367,10 @@ function settingsHtml() {
                     <input id="dice_pert_whitelist" type="text" class="text_pole" placeholder="留空 = 排除模式" />
                 </div>
                 <hr />
+                <div id="dice_pert_pools" style="margin: 6px 0;"></div>
                 <div>
                     <label for="dice_pert_library">
-                        骰子库（<code>## 类目名</code> 一行开新类目，下面每行一条语料，改完即生效）
+                        骰子库（<code># 卡池名</code> 开新卡池，<code>## 类目名</code> 开新类目，每行一条语料，改完即生效）
                         — <span id="dice_pert_stats"></span>
                     </label>
                     <textarea id="dice_pert_library" class="text_pole textarea_compact" rows="14"
@@ -374,9 +433,9 @@ function bindSettingsUI() {
         .val(settings.diceText)
         .on('input', function () { applyDiceText(this.value); });
 
-    // 初始统计
-    const { cats, total } = libraryStats(diceLibrary);
-    $('#dice_pert_stats').text(`${cats} 个类目 / ${total} 条`);
+    // 初始渲染：卡池选择器 + 统计
+    renderPoolSelector();
+    updateStatsLine();
 
     $('#dice_pert_clear_history').on('click', function () {
         rollHistory.length = 0;
@@ -387,7 +446,7 @@ function bindSettingsUI() {
     $('#dice_pert_test').on('click', function () {
         const roll = rollDice();
         if (roll) {
-            const msg = `[${roll.category}] ${roll.text}`;
+            const msg = `[${roll.pool}/${roll.category}] ${roll.text}`;
             console.log(`${LOG_TAG} 试掷 🎲 ${msg}`);
             if (typeof toastr !== 'undefined') toastr.info(msg, '🎲 骰子扰动');
         } else {
@@ -419,6 +478,83 @@ function addSettingsUI() {
 // 入口
 // ---------------------------------------------------------------
 
+// ---------------------------------------------------------------
+// 斜杠命令 /dicepool —— 供 Quick Reply 一键切换卡池
+//   /dicepool 剧情            只启用「剧情」池
+//   /dicepool 情感,场景       同时启用两个池（逗号/顿号/加号分隔均可）
+//   /dicepool 全部            清空选择 = 全部启用（all / 留空 同效）
+//   /dicepool off             关闭扰动总开关；/dicepool on 重新打开
+// ---------------------------------------------------------------
+
+function setActivePoolsByName(value) {
+    if (!diceLibrary) return '🎲 骰子库未加载';
+    const v = String(value || '').trim();
+
+    if (v === 'on' || v === '开') {
+        settings.enabled = true;
+        saveSettings();
+        $('#dice_pert_enabled').prop('checked', true);
+        return '🎲 扰动已开启';
+    }
+    if (v === 'off' || v === '关') {
+        settings.enabled = false;
+        saveSettings();
+        $('#dice_pert_enabled').prop('checked', false);
+        return '🎲 扰动已关闭';
+    }
+
+    const all = Object.keys(diceLibrary);
+    let msg;
+    if (!v || v === 'all' || v === '全部') {
+        settings.activePools = [];
+        msg = '🎲 卡池：全部启用';
+    } else {
+        const wanted = v.split(/[,，、+]+/).map(s => s.trim()).filter(Boolean);
+        const valid = wanted.filter(p => all.includes(p));
+        const invalid = wanted.filter(p => !all.includes(p));
+        if (valid.length === 0) {
+            return `🎲 没有匹配的卡池（现有：${all.join('、')}）`;
+        }
+        settings.activePools = valid;
+        msg = `🎲 卡池已切换：${valid.join('、')}`;
+        if (invalid.length) msg += `（未找到：${invalid.join('、')}）`;
+    }
+    saveSettings();
+    renderPoolSelector();
+    updateStatsLine();
+    return msg;
+}
+
+function registerSlashCommand() {
+    const ctx = getCtx();
+    if (!ctx) return;
+    const callback = (_namedArgs, value) => {
+        const msg = setActivePoolsByName(value);
+        if (typeof toastr !== 'undefined') toastr.info(msg, '🎲 骰子扰动', { timeOut: 2500 });
+        return msg;
+    };
+    const help = '切换骰子扰动卡池：/dicepool 剧情 | /dicepool 情感,场景 | /dicepool 全部 | /dicepool on|off';
+    try {
+        if (ctx.SlashCommandParser && ctx.SlashCommand && typeof ctx.SlashCommand.fromProps === 'function') {
+            ctx.SlashCommandParser.addCommandObject(ctx.SlashCommand.fromProps({
+                name: 'dicepool',
+                callback,
+                helpString: help,
+            }));
+            console.log(`${LOG_TAG} 斜杠命令 /dicepool 已注册（新API）`);
+            return;
+        }
+        if (typeof ctx.registerSlashCommand === 'function') {
+            ctx.registerSlashCommand('dicepool', callback, [], help, true, true);
+            console.log(`${LOG_TAG} 斜杠命令 /dicepool 已注册（旧API）`);
+            return;
+        }
+        console.warn(`${LOG_TAG} 未找到斜杠命令注册接口，/dicepool 不可用（面板勾选仍可用）`);
+    } catch (e) {
+        console.warn(`${LOG_TAG} 斜杠命令注册失败，面板勾选仍可用`, e);
+    }
+}
+
 jQuery(async () => {
     try {
         loadSettings();
@@ -437,9 +573,10 @@ jQuery(async () => {
         diceLibrary = parseDiceText(settings.diceText);
         addSettingsUI();
         installFetchHook();
+        registerSlashCommand();
 
-        const { cats, total } = libraryStats(diceLibrary);
-        console.log(`${LOG_TAG} v1.2.2 已就绪 | 启用: ${settings.enabled} | 剂量: ×${settings.repeat} | 骰子库: ${cats} 类 ${total} 条`);
+        const { pools, cats, total } = libraryStats(diceLibrary);
+        console.log(`${LOG_TAG} v1.4.0 已就绪 | 启用: ${settings.enabled} | 剂量: ×${settings.repeat} | 骰子库: ${pools} 池 ${cats} 类 ${total} 条`);
     } catch (e) {
         console.error(`${LOG_TAG} 初始化失败`, e);
         if (typeof toastr !== 'undefined') {
