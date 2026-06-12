@@ -206,7 +206,9 @@ function recordRoll(roll, repeat, ids) {
 }
 
 function isVectorQueryUrl(url) {
-    return url.includes('/api/vector/query') && !url.includes('/insert');
+    // 宽松匹配：兼容 /api/vector/query、/api/vectors/query、query-multi、以及云端部署的路径前缀
+    // 显式排除 insert/purge 等其它向量端点
+    return url.includes('/vector') && url.includes('/query') && !url.includes('/insert') && !url.includes('/purge');
 }
 
 function installFetchHook() {
@@ -225,6 +227,16 @@ function installFetchHook() {
                     const body = JSON.parse(init.body);
 
                     if (typeof body.searchText === 'string' && body.searchText.length > 0) {
+                        // WebLLM / KoboldCpp 的向量在浏览器端预先算好、按原文作 key 传递，
+                        // 改文本会导致 key 对不上，必须放行
+                        const clientSideEmbedding =
+                            body.source === 'webllm' || body.source === 'koboldcpp' ||
+                            (body.sourceSettings && body.sourceSettings.embeddings);
+                        if (clientSideEmbedding) {
+                            if (settings.logRoll) console.warn(`${LOG_TAG} ⛔ 检测到浏览器端嵌入来源（webllm/koboldcpp），本插件无法扰动该来源，已放行`);
+                            return origFetch.call(this, input, init);
+                        }
+
                         const { perturb, ids } = shouldPerturb(body);
 
                         if (perturb) {
@@ -413,7 +425,7 @@ jQuery(async () => {
         installFetchHook();
 
         const { cats, total } = libraryStats(diceLibrary);
-        console.log(`${LOG_TAG} v1.2.0 已就绪 | 启用: ${settings.enabled} | 剂量: ×${settings.repeat} | 骰子库: ${cats} 类 ${total} 条`);
+        console.log(`${LOG_TAG} v1.2.1 已就绪 | 启用: ${settings.enabled} | 剂量: ×${settings.repeat} | 骰子库: ${cats} 类 ${total} 条`);
     } catch (e) {
         console.error(`${LOG_TAG} 初始化失败`, e);
         if (typeof toastr !== 'undefined') {
