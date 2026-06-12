@@ -193,9 +193,11 @@ const rollHistory = [];
 function recordRoll(roll, repeat, ids) {
     const time = new Date().toLocaleTimeString();
     rollHistory.unshift(`${time} 🎲 [${roll.category}] ${roll.text} ×${repeat}`);
-    if (rollHistory.length > 20) rollHistory.pop();
+    if (rollHistory.length > 10) rollHistory.pop();
     const $box = $('#dice_pert_history');
     if ($box.length) $box.text(rollHistory.join('\n'));
+    const $count = $('#dice_pert_history_count');
+    if ($count.length) $count.text(rollHistory.length);
 
     if (settings.logRoll) {
         console.log(`${LOG_TAG} 🎲 [${roll.category}] ${roll.text} ×${repeat} → collection: ${ids.join(', ')}`);
@@ -315,9 +317,15 @@ function settingsHtml() {
                     <textarea id="dice_pert_library" class="text_pole textarea_compact" rows="14"
                         placeholder="## 类目名&#10;一条语料&#10;另一条语料&#10;&#10;## 下一个类目&#10;……"></textarea>
                 </div>
-                <div style="margin-top: 8px;">
-                    <label>最近 roll 记录（实时，刷新页面即清空）</label>
-                    <pre id="dice_pert_history" style="max-height: 160px; overflow-y: auto; white-space: pre-wrap; font-size: 0.85em; opacity: 0.85; margin: 4px 0;">（还没有记录——发一条消息试试）</pre>
+                <div class="inline-drawer" style="margin-top: 8px;">
+                    <div class="inline-drawer-toggle inline-drawer-header">
+                        <b>🎲 最近 roll 记录（<span id="dice_pert_history_count">0</span>）</b>
+                        <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+                    </div>
+                    <div class="inline-drawer-content">
+                        <pre id="dice_pert_history" style="max-height: 160px; overflow-y: auto; white-space: pre-wrap; font-size: 0.85em; opacity: 0.85; margin: 4px 0;">（还没有记录——发一条消息试试）</pre>
+                        <input id="dice_pert_clear_history" class="menu_button" type="button" value="清空记录" />
+                    </div>
                 </div>
                 <div class="flex-container" style="margin-top: 8px;">
                     <input id="dice_pert_test" class="menu_button" type="button" value="试掷一次 🎲" />
@@ -369,6 +377,12 @@ function bindSettingsUI() {
     // 初始统计
     const { cats, total } = libraryStats(diceLibrary);
     $('#dice_pert_stats').text(`${cats} 个类目 / ${total} 条`);
+
+    $('#dice_pert_clear_history').on('click', function () {
+        rollHistory.length = 0;
+        $('#dice_pert_history').text('（已清空）');
+        $('#dice_pert_history_count').text('0');
+    });
 
     $('#dice_pert_test').on('click', function () {
         const roll = rollDice();
@@ -425,7 +439,7 @@ jQuery(async () => {
         installFetchHook();
 
         const { cats, total } = libraryStats(diceLibrary);
-        console.log(`${LOG_TAG} v1.2.1 已就绪 | 启用: ${settings.enabled} | 剂量: ×${settings.repeat} | 骰子库: ${cats} 类 ${total} 条`);
+        console.log(`${LOG_TAG} v1.2.2 已就绪 | 启用: ${settings.enabled} | 剂量: ×${settings.repeat} | 骰子库: ${cats} 类 ${total} 条`);
     } catch (e) {
         console.error(`${LOG_TAG} 初始化失败`, e);
         if (typeof toastr !== 'undefined') {
