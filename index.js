@@ -135,33 +135,86 @@ function updateStatsLine() {
     $('#dice_pert_stats').text(`${pools} 池 / ${cats} 类 / ${total} 条 · ${actText}`);
 }
 
+function createNewPool() {
+    const name = (window.prompt('新卡池的名字？（例如：剧情 / 情感 / 场景）') || '').trim();
+    if (!name) return;
+    if (name.includes('#')) {
+        if (typeof toastr !== 'undefined') toastr.warning('池名里不要带 # 号', '🎲 骰子扰动');
+        return;
+    }
+    if (diceLibrary && Object.keys(diceLibrary).includes(name)) {
+        if (typeof toastr !== 'undefined') toastr.warning(`卡池「${name}」已存在`, '🎲 骰子扰动');
+        return;
+    }
+    const newText = (settings.diceText || '').replace(/\s+$/, '') + `\n\n# ${name}\n## 默认\n`;
+    $('#dice_pert_library').val(newText);
+    applyDiceText(newText);
+    if (typeof toastr !== 'undefined') {
+        toastr.success(`卡池「${name}」已创建——去骰子库末尾往它下面填语料`, '🎲 骰子扰动');
+    }
+}
+
+function chipToggle(pool) {
+    const all = Object.keys(diceLibrary || {});
+    let sel = Array.isArray(settings.activePools)
+        ? settings.activePools.filter(p => all.includes(p))
+        : [];
+    if (sel.length === 0) {
+        // 当前=全部启用：点某个池 → 只用这个池（直白切换）
+        sel = [pool];
+    } else if (sel.includes(pool)) {
+        sel = sel.filter(p => p !== pool);   // 取消选中；清空则回到全部
+    } else {
+        sel.push(pool);                       // 加选
+    }
+    settings.activePools = sel;
+    saveSettings();
+    renderPoolSelector();
+    updateStatsLine();
+}
+
 function renderPoolSelector() {
     const $box = $('#dice_pert_pools');
     if (!$box.length || !diceLibrary) return;
     const pools = Object.keys(diceLibrary);
-    const active = Array.isArray(settings.activePools) ? settings.activePools : [];
+    const active = getActivePools();
+    const explicit = Array.isArray(settings.activePools) && settings.activePools.length > 0;
     $box.empty();
-    if (pools.length <= 1) {
-        $box.append($('<small style="opacity:.7;"></small>')
-            .text('提示：在骰子库里用一行「# 卡池名」可分出多个卡池（剧情/场景/情感），在这里勾选切换。'));
-        return;
+
+    const $row = $('<div style="display:flex; flex-wrap:wrap; gap:6px; align-items:center;"></div>');
+
+    if (pools.length > 1) {
+        // 「全部」胶囊
+        const $allChip = $('<input type="button" class="menu_button" />')
+            .val(explicit ? '全部' : '✓ 全部')
+            .css('opacity', explicit ? 0.55 : 1)
+            .on('click', function () {
+                settings.activePools = [];
+                saveSettings();
+                renderPoolSelector();
+                updateStatsLine();
+            });
+        $row.append($allChip);
+
+        // 每个池一个胶囊：高亮=启用中，点按直白切换
+        for (const p of pools) {
+            const isOn = active.includes(p);
+            const $chip = $('<input type="button" class="menu_button" />')
+                .val((explicit && isOn ? '✓ ' : '') + p)
+                .css('opacity', isOn ? 1 : 0.55)
+                .on('click', function () { chipToggle(p); });
+            $row.append($chip);
+        }
+    } else {
+        $row.append($('<small style="opacity:.7;"></small>')
+            .text('目前只有一个卡池——点「新建卡池」分区（剧情/场景/情感），分出来就能一键切换。'));
     }
-    $box.append($('<small style="opacity:.7; display:block; margin-bottom:2px;"></small>')
-        .text('启用的卡池（可多选；全不勾 = 全部启用）：'));
-    for (const p of pools) {
-        const $label = $('<label class="checkbox_label" style="display:inline-flex; margin-right:12px;"></label>');
-        const $cb = $('<input type="checkbox" class="dice_pert_pool_cb">')
-            .val(p)
-            .prop('checked', active.includes(p));
-        $label.append($cb).append($('<span></span>').text(p));
-        $box.append($label);
-    }
-    $box.find('.dice_pert_pool_cb').on('change', function () {
-        settings.activePools = $box.find('.dice_pert_pool_cb:checked')
-            .map(function () { return $(this).val(); }).get();
-        saveSettings();
-        updateStatsLine();
-    });
+
+    const $newBtn = $('<input type="button" class="menu_button" value="➕ 新建卡池" />')
+        .on('click', createNewPool);
+    $row.append($newBtn);
+
+    $box.append($row);
 }
 
 function applyDiceText(text) {
@@ -576,7 +629,7 @@ jQuery(async () => {
         registerSlashCommand();
 
         const { pools, cats, total } = libraryStats(diceLibrary);
-        console.log(`${LOG_TAG} v1.4.0 已就绪 | 启用: ${settings.enabled} | 剂量: ×${settings.repeat} | 骰子库: ${pools} 池 ${cats} 类 ${total} 条`);
+        console.log(`${LOG_TAG} v1.5.0 已就绪 | 启用: ${settings.enabled} | 剂量: ×${settings.repeat} | 骰子库: ${pools} 池 ${cats} 类 ${total} 条`);
     } catch (e) {
         console.error(`${LOG_TAG} 初始化失败`, e);
         if (typeof toastr !== 'undefined') {
